@@ -1761,16 +1761,18 @@ function champRaceConfig(ch) {
    10 · SHADERS — GLSL ES 1.00 style (three.js converts for WebGL2)
    ====================================================================== */
 const SH = {};
-SH.enc = 'vec3 outc(vec3 c){\n#ifdef DIRECT\nreturn pow(max(c, vec3(0.0)), vec3(0.4545));\n#else\nreturn c;\n#endif\n}\n';
+SH.enc = 'vec3 outc(vec3 c){\nc = vec3(c.r > 0.0 ? c.r : 0.0, c.g > 0.0 ? c.g : 0.0, c.b > 0.0 ? c.b : 0.0);\n#ifdef DIRECT\nreturn pow(c, vec3(0.4545));\n#else\nreturn min(c, vec3(64.0));\n#endif\n}\n';
+/* NaN / Inf / negative sanitiser for HDR buffers: a single NaN texel would otherwise be smeared by the bloom blur into black blocks */
+SH.san = 'vec3 san(vec3 c){ return vec3(c.r > 0.0 ? min(c.r, 64.0) : 0.0, c.g > 0.0 ? min(c.g, 64.0) : 0.0, c.b > 0.0 ? min(c.b, 64.0) : 0.0); }\n';
 SH.quadVS = `
 varying vec2 vUv;
 void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
 
-SH.bright = `
+SH.bright = SH.san + `
 uniform sampler2D tColor; uniform float uThreshold; uniform float uKnee;
 varying vec2 vUv;
 void main(){
-  vec3 c = texture2D(tColor, vUv).rgb;
+  vec3 c = san(texture2D(tColor, vUv).rgb);
   float br = max(c.r, max(c.g, c.b));
   float soft = clamp(br - uThreshold + uKnee, 0.0, 2.0 * uKnee);
   soft = soft * soft / (4.0 * uKnee + 1e-4);
@@ -1800,9 +1802,11 @@ vec3 vpos(vec2 uv){
 float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
 void main(){
   float d0 = texture2D(tDepth, vUv).x;
-  if (d0 >= 0.99995) { gl_FragColor = vec4(1.0); return; }
+  if (d0 > 0.999999) { gl_FragColor = vec4(1.0); return; }
   vec3 p = vpos(vUv);
-  vec3 n = normalize(cross(dFdx(p), dFdy(p)));
+  vec3 cr = cross(dFdx(p), dFdy(p)); float cl = length(cr);
+  if (!(cl > 1e-9)) { gl_FragColor = vec4(1.0); return; }
+  vec3 n = cr / cl;
   if (dot(n, -p) < 0.0) n = -n;
   float rot = ign(gl_FragCoord.xy) * 6.2831853;
   float rUV = uRadius * uProjY / max(-p.z, 0.5) * 0.5;
@@ -1820,7 +1824,8 @@ void main(){
     occ += o * range / (1.0 + dist * dist * 0.35);
   }
   float ao = 1.0 - uIntensity * occ / float(SAMPLES) * 2.0;
-  gl_FragColor = vec4(vec3(clamp(ao, 0.0, 1.0)), 1.0);
+  if (!(ao >= 0.0)) ao = 1.0;
+  gl_FragColor = vec4(vec3(min(ao, 1.0)), 1.0);
 }`;
 
 SH.ssaoBlur = `
@@ -1842,7 +1847,7 @@ void main(){
   gl_FragColor = vec4(vec3(sum / w), 1.0);
 }`;
 
-SH.composite = `
+SH.composite = SH.san + `
 uniform sampler2D tScene; uniform sampler2D tAO;
 uniform sampler2D tB1; uniform sampler2D tB2; uniform sampler2D tB3; uniform sampler2D tB4; uniform sampler2D tB5;
 uniform float uHDR; uniform float uExposure; uniform float uBloomI; uniform float uAO; uniform float uBlur;
@@ -1853,7 +1858,7 @@ vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59)
 float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 vec3 samp(vec2 p){
   vec2 d = (p - 0.5) * uChroma;
-  return vec3(texture2D(tScene, p + d).r, texture2D(tScene, p).g, texture2D(tScene, p - d).b);
+  return san(vec3(texture2D(tScene, p + d).r, texture2D(tScene, p).g, texture2D(tScene, p - d).b));
 }
 void main(){
   vec2 uv = vUv; vec2 cc = uv - 0.5;
@@ -1866,15 +1871,15 @@ void main(){
     }
     col = acc / float(BLUR_N);
   } else { col = samp(uv); }
-  if (uAO > 0.001) { float ao = texture2D(tAO, uv).r; col *= mix(1.0, ao, uAO); }
-  vec3 bl = texture2D(tB1, uv).rgb * 0.9 + texture2D(tB2, uv).rgb * 0.8 + texture2D(tB3, uv).rgb * 0.7;
-  if (uLevels > 3.5) { bl += texture2D(tB4, uv).rgb * 0.6 + texture2D(tB5, uv).rgb * 0.5; }
+  if (uAO > 0.001) { float ao = texture2D(tAO, uv).r; ao = ao > 0.05 ? max(ao, 0.35) : 1.0; col *= mix(1.0, ao, uAO); }
+  vec3 bl = san(texture2D(tB1, uv).rgb) * 0.9 + san(texture2D(tB2, uv).rgb) * 0.8 + san(texture2D(tB3, uv).rgb) * 0.7;
+  if (uLevels > 3.5) { bl += san(texture2D(tB4, uv).rgb) * 0.6 + san(texture2D(tB5, uv).rgb) * 0.5; }
   col += bl * uBloomI;
   if (uShaft > 0.001) {
     vec2 dir = (uSun - uv) * (0.92 / float(SHAFT_N));
     vec2 p = uv; vec3 sh = vec3(0.0); float decay = 1.0;
-    for (int i = 0; i < SHAFT_N; i++) { p += dir; sh += texture2D(tB1, p).rgb * decay; decay *= 0.94; }
-    float vis = smoothstep(1.4, 0.2, length(uSun - 0.5) * 1.4);
+    for (int i = 0; i < SHAFT_N; i++) { p += dir; sh += san(texture2D(tB1, p).rgb) * decay; decay *= 0.94; }
+    float vis = 1.0 - smoothstep(0.2, 1.4, length(uSun - 0.5) * 1.4);
     col += sh * (uShaft / float(SHAFT_N)) * vis;
   }
   col += vec3(0.55, 0.6, 0.8) * uFlash * 0.45;
@@ -1940,7 +1945,7 @@ void main(){
   vec3 d = normalize(vDir);
   float h = d.y;
   vec3 col = mix(uHorizon, uTop, pow(clamp(h, 0.0, 1.0), 0.5));
-  col = mix(col, uGround, smoothstep(0.0, -0.22, h));
+  col = mix(col, uGround, 1.0 - smoothstep(-0.22, 0.0, h));
   float sd = max(dot(d, uSunDir), 0.0);
   col += uSunColor * (pow(sd, 6.0) * 0.18 + pow(sd, 90.0) * 0.55) * uSunPower;
   col += uSunColor * smoothstep(0.99955, 0.99985, sd) * 14.0 * uSunPower;
@@ -1948,7 +1953,7 @@ void main(){
   col += vec3(0.75, 0.82, 1.0) * (smoothstep(0.9994, 0.9998, md) * 3.0 + pow(md, 60.0) * 0.12) * uStars;
   if (uStars > 0.01 && h > 0.0) {
     vec3 p = d * 220.0; vec3 ip = floor(p); vec3 fp = fract(p) - 0.5;
-    float r = h31(ip); float s = step(0.988, r) * smoothstep(0.42, 0.0, length(fp));
+    float r = h31(ip); float s = step(0.988, r) * (1.0 - smoothstep(0.0, 0.42, length(fp)));
     col += vec3(0.9, 0.95, 1.0) * s * uStars * (0.6 + 0.8 * h31(ip + 3.1)) * smoothstep(0.0, 0.2, h);
   }
   #if CLOUD_OCT > 0
@@ -1965,6 +1970,9 @@ void main(){
   #endif
   col += vec3(0.5, 0.55, 0.75) * uFlash * 0.6;
   gl_FragColor = vec4(outc(col), 1.0);
+  #ifndef DIRECT
+  gl_FragColor = linearToOutputTexel(gl_FragColor); // render targets: PMREM environment maps are RGBE-encoded in r128 (alpha = exponent) — raw alpha 1.0 made every PBR surface blow out
+  #endif
 }`;
 
 /* ---------------- RAIN (GPU animated line streaks) ---------------- */
@@ -1999,7 +2007,7 @@ SH.partFS = `
 varying vec4 vColor; uniform float uHard;
 void main(){
   vec2 c = gl_PointCoord - 0.5; float d = length(c) * 2.0;
-  float a = clamp(1.0 - d, 0.0, 1.0); a = mix(a * a, smoothstep(1.0, 0.7, d), uHard);
+  float a = clamp(1.0 - d, 0.0, 1.0); a = mix(a * a, 1.0 - smoothstep(0.7, 1.0, d), uHard);
   if (a * vColor.a < 0.004) discard;
   gl_FragColor = vec4(outc(vColor.rgb), vColor.a * a);
 }`;
@@ -2049,7 +2057,7 @@ const GFX = (() => {
   const G = {
     renderer: null, canvas: null, caps: null, id: 'normal', P: PRESETS.normal, E: null, limits: [],
     userScale: 1, dynScale: 1, degrade: 0, adaptive: true, pr: 1, w: 0, h: 0, fps: 60, frameMs: 16, target: 55, noticeT: 0, notice: '',
-    ready: false, lost: false, post: null, cube64: null, onRebuild: null, paused: false, calls: 0, tris: 0, maxFps: 0, sceneTimeMs: 0, tw: 0, th: 0
+    ready: false, lost: false, post: null, fixLv: { normal: 0, high: 0, ultra: 0 }, worldLv: { normal: 0, high: 0, ultra: 0 }, fixMsg: '', selfInfo: '', shaderErrs: 0, needEscalate: false, watch: null, cube64: null, onRebuild: null, paused: false, calls: 0, tris: 0, maxFps: 0, sceneTimeMs: 0, tw: 0, th: 0
   };
   let lowCnt = 0, highCnt = 0, acc = 0, nFrames = 0, accT = 0, bootT = 0, lastLayout = 0, quad = null, quadScene = null, quadCam = null, whiteTex = null, blackTex = null;
   const noAO = [];
@@ -2058,6 +2066,7 @@ const GFX = (() => {
   /* ---------------- init ---------------- */
   G.init = function (canvas) {
     G.canvas = canvas;
+    if (!G._hooked) { G._hooked = true; const ce = console.error; console.error = function () { try { if (/WebGLProgram|shader error/i.test(String(arguments[0]))) G.shaderErrs++; } catch (e) { /* ignore */ } return ce.apply(console, arguments); }; }
     const ua = navigator.userAgent || '';
     const mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(ua));
     let r = null;
@@ -2092,6 +2101,7 @@ const GFX = (() => {
     quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     quadScene = new THREE.Scene();
     quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({ color: 0xffffff })); quad.frustumCulled = false; quadScene.add(quad);
+    GFX_ORDER.forEach(k => { try { const v = String(Store.get('apex_gfxfix_v2_' + k) || '').split('|'); const ok = v[1] === String(gpu).slice(0, 48), n = String(v[0] || '0').split(','); G.fixLv[k] = ok ? clamp(parseInt(n[0], 10) || 0, 0, 7) : 0; G.worldLv[k] = ok ? clamp(parseInt(n[1], 10) || 0, 0, 2) : 0; } catch (e) { G.fixLv[k] = 0; G.worldLv[k] = 0; } });
     G.ready = true;
     return true;
   };
@@ -2114,6 +2124,26 @@ const GFX = (() => {
     if (d >= 1) { E.mblur = 0; E.grain = 0; E.chroma = Math.min(E.chroma, 1); E.glowShafts = 0; E.cinematic = false; }
     if (d >= 2) { E.ssao = 0; E.bloom = Math.min(E.bloom, 1); E.particles *= 0.6; E.rain = Math.floor(E.rain * 0.6); E.skid = Math.floor(E.skid * 0.6); E.mirrorCube = 0; }
     if (d >= 3) { E.shadowMap = Math.max(1024, E.shadowMap >> 1); E.fxaa = false; E.dynLights = 0; E.grass = 0; E.clouds = Math.min(E.clouds, 1); }
+    // self-test ladder: only trims what this device failed to render correctly (the preset itself is never changed)
+    const fl = G.fixLv[id] | 0;
+    if (fl > 0 && E.post) {
+      const off = [];
+      if (fl >= 1) { if (E.msaa) off.push('MSAA'); E.msaa = 0; E.fxaa = true; }
+      if (fl >= 2) { if (E.ssao) off.push('SSAO'); E.ssao = 0; }
+      if (fl >= 3) { off.push('image-based lighting'); E.pmrem = false; }
+      if (fl >= 4) { off.push('HDR buffers'); E.hdr = false; E.fxaa = false; E.hdrMsaaOk = true; }
+      if (fl >= 5) { off.push('shadow maps & dynamic lights'); E.shadowMap = 0; E.dynLights = 0; E.spot = 0; E.mirrorCube = 0; }
+      if (fl >= 6) { off.push('PBR materials'); E.mat = 0; E.pmrem = false; }
+      if (fl >= 7) { off.push('post-processing'); E.post = false; E.msaa = 0; E.ssao = 0; E.bloom = 0; E.fxaa = false; E.mblur = 0; E.chroma = 0; E.grain = 0; E.cinematic = false; E.hdr = false; }
+      lim.push('Compatibility mode (self-test): ' + off.join(', ') + ' off');
+    }
+    const wl = G.worldLv[id] | 0;
+    if (wl > 0 && E.post) {
+      const off = [];
+      if (E.shadowMap || E.dynLights || E.spot) off.push('shadow maps & dynamic lights'); E.shadowMap = 0; E.dynLights = 0; E.spot = 0; E.mirrorCube = 0;
+      if (wl >= 2) { off.push('PBR materials'); E.mat = 0; E.pmrem = false; }
+      lim.push('Compatibility mode (shader errors): ' + off.join(', ') + ' off');
+    }
     E.shafts = (E.cinematic && E.bloom >= 2) ? 1 : 0;
     E.bloomLevels = E.bloom >= 2 ? 5 : E.bloom >= 1 ? 3 : 0;
     G.limits = lim;
@@ -2187,16 +2217,79 @@ const GFX = (() => {
   }
 
   /* ---------------- preset application ---------------- */
-  G.setPreset = function (id, keepDegrade) {
-    if (!PRESETS[id]) id = 'normal';
-    G.id = id; G.P = PRESETS[id]; if (!keepDegrade) { G.degrade = 0; G.dynScale = 1; }
+  function applyE(id) {
     G.E = G.effective(id);
-    const r = G.renderer; if (!r) return;
+    const r = G.renderer; if (!r) return false;
     r.shadowMap.enabled = G.E.shadowMap > 0;
     r.shadowMap.type = G.E.shadowType === 0 ? THREE.BasicShadowMap : THREE.PCFSoftShadowMap;
     r.toneMapping = THREE.NoToneMapping;
     r.outputEncoding = G.E.post ? THREE.LinearEncoding : THREE.sRGBEncoding;
-    G.layout(true);
+    G.layout(true); return true;
+  }
+  G.setPreset = function (id, keepDegrade) {
+    if (!PRESETS[id]) id = 'normal';
+    G.id = id; G.P = PRESETS[id]; if (!keepDegrade) { G.degrade = 0; G.dynScale = 1; }
+    if (!applyE(id)) return;
+    G.verify(id);
+  };
+  G.FIX_NAMES = ['', 'MSAA', 'SSAO', 'image-based lighting', 'HDR buffers', 'shadows & dynamic lights', 'PBR materials', 'post-processing'];
+  /* Render a known probe scene through the full chain of the active preset; step down the compatibility ladder until it shows up correctly */
+  G.verify = function (id) {
+    const before = G.fixLv[id] | 0; let guard = 0;
+    while (G.E && G.E.post && guard++ < 8) {
+      let ok = true; try { ok = G.selfTest(); } catch (e) { console.warn('graphics self-test error', e); ok = false; }
+      if (ok) break;
+      G.fixLv[id] = Math.min(7, (G.fixLv[id] | 0) + 1);
+      console.warn('Graphics self-test failed for ' + id + ' — compatibility level ' + G.fixLv[id] + ' (' + G.FIX_NAMES[G.fixLv[id]] + ' off)');
+      applyE(id);
+    }
+    G.shaderErrs = 0; const now = G.fixLv[id] | 0;
+    persistFix(id);
+    if (now > before) { const names = []; for (let i = before + 1; i <= now; i++) names.push(G.FIX_NAMES[i]); G.fixMsg = PRESETS[id].name + ': ' + names.join(', ') + ' turned off after a self-test found it did not render correctly on this device. Preset unchanged.'; }
+  };
+  function persistFix(id) { try { Store.set('apex_gfxfix_v2_' + id, (G.fixLv[id] | 0) + ',' + (G.worldLv[id] | 0) + '|' + String((G.caps && G.caps.gpu) || '').slice(0, 48)); } catch (e) { /* ignore */ } }
+  G.takeFixMsg = function () { const m = G.fixMsg; G.fixMsg = ''; return m; };
+  G.resetFix = function () { GFX_ORDER.forEach(k => { G.fixLv[k] = 0; G.worldLv[k] = 0; Store.del('apex_gfxfix_v2_' + k); }); };
+  G.selfTest = function () {
+    const r = G.renderer, E = G.E; if (!r || !E.post || !G.post || G.lost) return true;
+    const W = 64, H = 36, buf = new Uint8Array(W * H * 4), made = [], lights = [];
+    const keep = o => { made.push(o); return o; };
+    const out = new THREE.WebGLRenderTarget(W, H, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat, type: THREE.UnsignedByteType, depthBuffer: false, stencilBuffer: false });
+    const sc = new THREE.Scene(), cam = new THREE.PerspectiveCamera(58, W / H, 0.25, Math.min(E.far, 1500));
+    cam.position.set(0, 2.4, 8); cam.lookAt(0, 1.2, 0); cam.updateMatrixWorld(true); cam.updateProjectionMatrix();
+    let good = 0, pts = [], blown = 0, envOut = null;
+    try {
+      sc.fog = new THREE.FogExp2(lin(0xa9bdd6).getHex(), 0.002); sc.fog.color.copy(lin(0xa9bdd6));
+      const sky = new THREE.Mesh(keep(new THREE.SphereGeometry(1, 16, 8)), keep(makeSkyMat(TOD.day, E, false))); sky.frustumCulled = false; sky.renderOrder = -100; sky.scale.setScalar(400); sky.position.copy(cam.position); sc.add(sky);
+      const sh = E.shadowMap > 0;
+      if (E.pmrem) { const es = new THREE.Scene(), em = keep(makeSkyMat(TOD.day, E, true)), eg = keep(new THREE.SphereGeometry(10, 24, 12)); es.add(new THREE.Mesh(eg, em)); envOut = G.makeEnv(es); if (envOut.pmrem) sc.environment = envOut.tex; }
+      const ground = new THREE.Mesh(keep(new THREE.PlaneGeometry(300, 300).rotateX(-Math.PI / 2)), keep(mkMat({ color: 0x55703c, rough: 0.9 }))); ground.receiveShadow = sh; sc.add(ground);
+      const ball = new THREE.Mesh(keep(new THREE.SphereGeometry(1.1, 24, 16)), keep(mkMat({ color: 0xd8281c, metal: 0.15, rough: 0.35, clear: 1 }))); ball.position.set(0, 1.2, 0); ball.castShadow = sh; ball.receiveShadow = sh; sc.add(ball);
+      const bg = keep(new THREE.BoxGeometry(1.4, 1.2, 1.4)), n = bg.attributes.position.count, ca = new Float32Array(n * 3); for (let i = 0; i < n; i++) { ca[i * 3] = 0.8; ca[i * 3 + 1] = 0.55; ca[i * 3 + 2] = 0.2; }
+      bg.setAttribute('color', new THREE.BufferAttribute(ca, 3));
+      const lam = keep(mkMat({ vc: true, lambert: true, rough: 1 })), box = new THREE.Mesh(bg, lam); box.position.set(-3, 0.6, -1); box.castShadow = sh; box.receiveShadow = sh; sc.add(box);
+      const im = new THREE.InstancedMesh(keep(new THREE.BoxGeometry(0.6, 1.6, 0.6)), keep(mkMat({ color: 0x3f7a2e, lambert: true, rough: 1 })), 3), m4 = new THREE.Matrix4(); for (let i = 0; i < 3; i++) { m4.makeTranslation(3 + i * 1.2, 0.8, -2); im.setMatrixAt(i, m4); if (im.setColorAt) im.setColorAt(i, new THREE.Color(0.6 + i * 0.1, 0.8, 0.5)); } im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; im.castShadow = sh; sc.add(im);
+      const hemi = new THREE.HemisphereLight(lin(0xb4cce8), lin(0x3a3a30), 0.9); sc.add(hemi);
+      const sun = new THREE.DirectionalLight(lin(0xfff0dd), 2.6); sun.position.set(60, 90, 40); sc.add(sun, sun.target); lights.push(sun);
+      if (sh) { sun.castShadow = true; sun.shadow.mapSize.set(E.shadowMap, E.shadowMap); const c = sun.shadow.camera; c.left = c.bottom = -30; c.right = c.top = 30; c.near = 10; c.far = 250; sun.shadow.bias = -0.00035; sun.shadow.normalBias = 0.05; }
+      for (let i = 0; i < (E.spot >= 2 ? 4 : E.spot ? 2 : 0); i++) { const sp = new THREE.SpotLight(lin(0xfff2dc), 0, 95, 0.42, 0.55, 1.4); sp.position.set(0, 1, 6); sc.add(sp, sp.target); }
+      for (let i = 0; i < (E.dynLights >= 2 ? 2 : 0); i++) { sc.add(new THREE.PointLight(lin(0xff2a14), 0, 14, 2)); }
+      G.render(sc, cam, {}, out);
+      r.setRenderTarget(out); r.readRenderTargetPixels(out, 0, 0, W, H, buf); r.setRenderTarget(null);
+      const px = (x, y) => { const i = (y * W + x) * 4; return Math.max(buf[i], buf[i + 1], buf[i + 2]); };
+      const pn = (x, y) => { const i = (y * W + x) * 4; return Math.min(buf[i], buf[i + 1], buf[i + 2]); };
+      pts = [px(8, 31), px(56, 31), px(8, 4), px(56, 4), px(32, 16)]; good = pts.filter(v => v >= 36).length;
+      blown = [pn(8, 4), pn(56, 4), pn(32, 16)].filter(v => v >= 225).length; // lit green ground / red sphere must never be white
+    } finally {
+      try { r.setRenderTarget(null); } catch (e) { /* ignore */ }
+      try { if (envOut && envOut.pmrem) envOut.pmrem.dispose(); if (envOut && envOut.cube) envOut.cube.dispose(); } catch (e) { /* ignore */ }
+      lights.forEach(l => { try { if (l.shadow && l.shadow.dispose) l.shadow.dispose(); } catch (e) { /* ignore */ } });
+      made.forEach(o => { try { o.dispose(); } catch (e) { /* ignore */ } }); try { out.dispose(); } catch (e) { /* ignore */ }
+      sc.traverse(o => { if (o.isInstancedMesh && o.dispose) { try { o.dispose(); } catch (e) { /* ignore */ } } });
+    }
+    const pass = good >= 4 && blown < 2;
+    G.selfInfo = (pass ? 'passed' : (blown >= 2 ? 'FAILED (white-out)' : 'FAILED')) + ' · probes ' + pts.join('/') + ' · level ' + (G.fixLv[G.id] | 0);
+    return pass;
   };
   G.refreshEffective = function () { G.E = G.effective(G.id); G.layout(true); Bus.emit('gfxchange'); };
 
@@ -2235,11 +2328,11 @@ const GFX = (() => {
   /* ---------------- frame ---------------- */
   G.shadowTick = function () { if (G.renderer.shadowMap.enabled) G.renderer.shadowMap.needsUpdate = true; };
 
-  G.render = function (scene, cam, fx) {
+  G.render = function (scene, cam, fx, outRT) {
     const r = G.renderer, E = G.E, p = G.post; if (!r || G.lost) return;
     fx = fx || {};
     G.shadowTick();
-    if (!E.post || !p) { r.setRenderTarget(null); r.render(scene, cam); return; }
+    if (!E.post || !p) { r.setRenderTarget(outRT || null); r.render(scene, cam); return; }
     // ---- depth pre-pass for SSAO (override material, no colour writes)
     if (p.depth) {
       const hid = []; for (let i = 0; i < noAO.length; i++) { const o = noAO[i]; if (o.visible) { o.visible = false; hid.push(o); } }
@@ -2276,9 +2369,36 @@ const GFX = (() => {
     cu.uChroma.value = E.chroma ? (0.0012 + (fx.chroma || 0) * 0.006) * (E.chroma >= 2 ? 1.2 : 0.7) : 0;
     cu.uGrain.value = E.grain ? 1 : 0; cu.uTime.value = (performance.now() % 100000) * 0.001; cu.uFlash.value = fx.flash || 0;
     if (E.shafts && fx.sun) { cu.uSun.value.set(fx.sun[0], fx.sun[1]); cu.uShaft.value = fx.sunVis || 0; } else cu.uShaft.value = 0;
-    if (p.fxaaM) { pass(p.comp, p.ldr); p.fxaaM.uniforms.tColor.value = p.ldr.texture; pass(p.fxaaM, null); }
-    else pass(p.comp, null);
+    if (p.fxaaM) { pass(p.comp, p.ldr); p.fxaaM.uniforms.tColor.value = p.ldr.texture; pass(p.fxaaM, outRT || null); }
+    else pass(p.comp, outRT || null);
     r.setRenderTarget(null);
+    if (G.watch && !outRT) watchTick(r);
+  };
+  /* Real-scene watchdog: a handful of 1-pixel-high strips read back from the finished frame; a daytime picture that is >80% black is a failed effect */
+  G.watchStart = function (expectBright) { G.watch = (expectBright && G.E && G.E.post) ? { n: 0, i: 0, bad: 0, at: [40, 80, 130, 190, 260], buf: null } : null; };
+  function watchTick(r) {
+    const w = G.watch; w.n++; if (w.n < w.at[w.i]) return; w.i++;
+    let frac = 0;
+    try {
+      const gl = r.getContext(); if (!gl || !gl.readPixels) { G.watch = null; return; }
+      const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight; if (!(W > 8 && H > 8)) { G.watch = null; return; }
+      if (!w.buf || w.buf.length < W * 4) w.buf = new Uint8Array(W * 4);
+      let dark = 0, tot = 0;
+      [0.3, 0.45, 0.6, 0.8].forEach(f => { gl.readPixels(0, Math.floor(H * f), W, 1, gl.RGBA, gl.UNSIGNED_BYTE, w.buf); for (let i = 0; i < W * 4; i += 12) { tot++; if (w.buf[i] < 12 && w.buf[i + 1] < 12 && w.buf[i + 2] < 12) dark++; } });
+      frac = tot ? dark / tot : 0;
+    } catch (e) { G.watch = null; return; }
+    G.watchInfo = Math.round(frac * 100) + '% dark';
+    if (frac > 0.8) { w.bad++; if (w.bad >= 2) { G.watch = null; G.needEscalate = true; } } else G.watch = null;
+    if (G.watch && w.i >= w.at.length) G.watch = null;
+  }
+  G.escalate = function (why) {
+    const id = G.id; if (!G.E || !G.E.post) return false;
+    const cur = G.fixLv[id] | 0, wl = G.worldLv[id] | 0; let names = [];
+    if (why === 'shader' && wl < 2) { G.worldLv[id] = wl + 1; names = wl === 0 ? ['shadow maps & dynamic lights'] : ['PBR materials']; }
+    else { if (cur >= 7) return false; G.fixLv[id] = cur + 1; names = [G.FIX_NAMES[cur + 1]]; }
+    persistFix(id); G.watch = null; applyE(id); G.shaderErrs = 0;
+    G.fixMsg = PRESETS[id].name + ': ' + names.join(', ') + ' turned off — ' + (why === 'shader' ? 'a shader failed to compile on this device' : 'the picture rendered black') + '. Preset unchanged.';
+    return true;
   };
 
   /* ---------------- performance monitor & adaptive guard ---------------- */
@@ -2326,6 +2446,8 @@ const GFX = (() => {
     L.push(['GPU', c.gpu.replace(/ANGLE \(|\)$/g, '').slice(0, 44)]);
     L.push(['Device', (c.mobile ? 'mobile/tablet' : 'desktop') + ' · ' + c.cores + ' cores · DPR ' + c.dpr.toFixed(1)]);
     if (G.limits.length) L.push(['Limited', G.limits.join('; ')]);
+    if (G.selfInfo) L.push(['Self-test', G.selfInfo]);
+    if (G.watchInfo) L.push(['Frame check', G.watchInfo]);
     return L;
   };
 
@@ -3321,6 +3443,7 @@ function createCameraRig(aspect) {
   const cam = new THREE.PerspectiveCamera(62, aspect || 1.6, 0.25, 1500); cam.rotation.order = 'YXZ';
   const C = { cam, idx: 0, mode: 'chase', yaw: 0, shake: 0, t: 1, from: { p: new THREE.Vector3(), q: new THREE.Quaternion(), fov: 62 }, override: null, ovT: 0, look: new THREE.Vector3(), lookInit: false, bump: 0, hint: -1 };
   const tp = new THREE.Vector3(), tq = new THREE.Quaternion(), tl = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0), m4 = new THREE.Matrix4(), tmpV = new THREE.Vector3(), tmpQ = new THREE.Quaternion(), tmpE = new THREE.Euler(), q2 = makeQ(), tA = {};
+  const FLIP_Y = new THREE.Quaternion(0, 1, 0, 0); // car models face +Z; a three.js camera looks down -Z, so cockpit/bumper cameras turn 180° about Y
   let fovT = 62, nearT = 0.25;
   C.setMode = function (id, instant) {
     const i = CAMERAS.findIndex(c => c.id === id); if (i < 0) return; if (CAMERAS[i].id === C.mode && !instant) return;
@@ -3362,10 +3485,10 @@ function createCameraRig(aspect) {
       rig.root.updateMatrixWorld(true);
       if (C.mode === 'bumper') {
         tp.copy(rig.bumper); tp.x += Math.sin(Date.now() * 0.05) * rumble * 0.5; tp.y += Math.sin(Date.now() * 0.071) * rumble; rig.body.localToWorld(tp);
-        tq.setFromRotationMatrix(rig.body.matrixWorld); fov = 76 + spd * 8 + (car.nitroOn ? 6 : 0); near = 0.12;
+        tq.setFromRotationMatrix(rig.body.matrixWorld); tq.multiply(FLIP_Y); fov = 76 + spd * 8 + (car.nitroOn ? 6 : 0); near = 0.12;
       } else { // interior: driver's head with g-force sway
         tp.copy(rig.eye); tp.x += -car.ayS * 0.0035 - car.steerIn * 0.02; tp.z += car.axS * -0.0022; tp.y += Math.sin(Date.now() * 0.06) * rumble * 0.6; rig.body.localToWorld(tp);
-        tq.setFromRotationMatrix(rig.body.matrixWorld); tmpE.set(-0.02 + car.axS * 0.0008, car.steerIn * -0.1 - car.yawRate * 0.03, -car.ayS * 0.0012, 'YXZ'); tmpQ.setFromEuler(tmpE); tq.multiply(tmpQ);
+        tq.setFromRotationMatrix(rig.body.matrixWorld); tq.multiply(FLIP_Y); tmpE.set(-0.02 + car.axS * 0.0008, car.steerIn * -0.1 - car.yawRate * 0.03, -car.ayS * 0.0012, 'YXZ'); tmpQ.setFromEuler(tmpE); tq.multiply(tmpQ);
         fov = 72 + spd * 9 + (car.nitroOn ? 7 : 0); near = 0.05;
       }
     }
@@ -3645,7 +3768,7 @@ const UI = (() => {
         '<div class="grid g2" style="align-items:start"><div class="panel"><h3>Performance</h3>' + tog('adaptive', 'Adaptive performance', 'If the frame rate drops, resolution and heavy effects are trimmed temporarily. Your chosen preset is never changed.', st.adaptive) +
         slider('scale', 'Resolution scale', 50, 100, 5, Math.round(st.scale * 100), v => v + '%') + '<div class="hint">Lower this on slow devices for extra smoothness.</div>' +
         tog('fps', 'FPS counter', null, st.fps) + tog('info', 'Info panel', 'GPU, resolution, draw calls and active effects', st.info) + '</div>' +
-        '<div class="panel"><h3>This device</h3>' + (GFX.caps ? '<div class="hint" style="font-family:var(--mono);line-height:1.7;margin:0">' + GFX.infoLines().filter(l => ['Preset', 'WebGL', 'GPU', 'Device', 'Shadows', 'Post', 'Materials', 'Limited'].indexOf(l[0]) >= 0).map(l => '<b style="color:var(--acc3);font-weight:600">' + l[0] + '</b> ' + esc(l[1])).join('<br>') + '</div>' : '') + '</div></div>';
+        '<div class="panel"><h3>This device</h3>' + (GFX.caps ? '<div class="hint" style="font-family:var(--mono);line-height:1.7;margin:0">' + GFX.infoLines().filter(l => ['Preset', 'WebGL', 'GPU', 'Device', 'Shadows', 'Post', 'Materials', 'Limited', 'Self-test'].indexOf(l[0]) >= 0).map(l => '<b style="color:var(--acc3);font-weight:600">' + l[0] + '</b> ' + esc(l[1])).join('<br>') + '</div><button class="btn sm" style="margin-top:10px" data-act="gfxRecheck">Re-run graphics check</button><div class="hint">Every start, HIGH and ULTRA render a test scene; if an effect does not display correctly on this device it is switched off automatically and the preset stays selected. This button clears that and tests again.</div>' : '') + '</div></div>';
     } else if (U.tab === 'cam') {
       h += '<div class="grid g3">' + CAMERAS.map(c => {
         const d = { chase: 'Behind and above the car with smooth lag, speed-based field of view and nitro push. Never clips into scenery.', bumper: 'Low on the nose for maximum speed sensation. Follows the body’s pitch and roll.', interior: 'Driver’s seat: detailed dashboard, working steering wheel and live gauges.' }[c.id];
@@ -3784,6 +3907,7 @@ const UI = (() => {
     settings: d => { U.backTo = d.from || 'main'; U.show('settings'); },
     tab: d => { U.tab = d.v; U.render(); },
     gfx: d => Game.applyGfx(d.v),
+    gfxRecheck: () => Game.recheckGfx(),
     cam: d => { Game.setCamera(d.v); U.render(); },
     camLive: d => { Game.setCamera(d.v); U.render(); },
     tog: d => { Game.toggleSetting(d.k); U.render(); },
@@ -4177,6 +4301,7 @@ function buildRaceVisuals(R) {
   });
   const fx = createFX(world.scene, T), camRig = createCameraRig(GFX.w / Math.max(1, GFX.h)); camRig.far(E.far);
   world.setMode(R.mode); world.setGantry(0, false);
+  GFX.watchStart((cfg.tod || 'day') !== 'night');
   const V = { R, world, rigs, pairs, vis, prev, fx, camRig, pl: R.player, plRig: rigs.get(R.player), engP: null, engA: [], ghost: null, ghostQ: makeQ(), lightsOn: false, fxState: { exposure: 1, blur: 0, chroma: 0, flash: 0, sun: sunOut, sunVis: 0, bloom: 1 }, cdLast: -1, crowd: 0.4 };
   if (R.ghost.play) {
     const gd = CAR_BY_ID[R.ghost.play.car] || R.player.def, gc = { color: '#8cc8ff', accent: '#ffffff', finish: 'gloss', wheel: 'five', wcol: '#c4c8cf' };
@@ -4252,12 +4377,26 @@ const Game = {
   },
   cycleCamera() { const i = CAMERAS.findIndex(c => c.id === SAVE.settings.cam); Game.setCamera(CAMERAS[(i + 1) % CAMERAS.length].id); },
   toggleHeadlights() { const o = ['auto', 'on', 'off'], i = o.indexOf(SAVE.settings.headlights); SAVE.settings.headlights = o[(i + 1) % 3]; writeSave(); UI.toast('Headlights: ' + SAVE.settings.headlights.toUpperCase(), 'acc'); },
+  escalateGfx(why) {
+    if (APP.busy || !GFX.escalate(why)) return;
+    try { Game.rebuildVisuals(); } catch (e) { console.error(e); }
+    APP.last = performance.now(); const m = GFX.takeFixMsg(); if (m) UI.notice(m);
+  },
+  recheckGfx() {
+    if (APP.busy) return; APP.busy = true; UI.busy('Checking graphics…', 'Rendering a test scene'); GFX.resetFix();
+    setTimeout(() => {
+      try { GFX.setPreset(GFX.id); Game.rebuildVisuals(); } catch (e) { console.error(e); UI.notice('Graphics check failed: ' + (e && e.message)); }
+      APP.busy = false; UI.overlay(null); if (UI.cur === 'settings') UI.render(); APP.last = performance.now();
+      const m = GFX.takeFixMsg(); UI.notice(m || PRESETS[GFX.id].name + ' graphics check passed — every effect displays correctly.');
+    }, 70);
+  },
   applyGfx(id) {
     if (!PRESETS[id] || APP.busy) return; if (SAVE.settings.gfx === id && GFX.id === id) return;
     APP.busy = true; UI.busy('Applying ' + PRESETS[id].name + ' graphics…', 'Rebuilding scene'); SAVE.settings.gfx = id; writeSave();
     setTimeout(() => {
       try { GFX.setPreset(id); Game.rebuildVisuals(); } catch (e) { console.error(e); UI.notice('Could not apply ' + PRESETS[id].name + ': ' + (e && e.message)); }
       APP.busy = false; UI.overlay(null); if (UI.cur === 'settings') UI.render(); APP.last = performance.now();
+      const fm = GFX.takeFixMsg(); if (fm) UI.notice(fm);
     }, 70);
   },
   rebuildVisuals() {
@@ -4446,6 +4585,7 @@ function bindEvents() {
    ====================================================================== */
 function frame(now) {
   APP.raf = requestAnimationFrame(frame);
+  if (GFX.needEscalate) { GFX.needEscalate = false; Game.escalateGfx('black'); } else if (GFX.shaderErrs > 0) { const n = GFX.shaderErrs; GFX.shaderErrs = 0; if (GFX.E.post && n > 0 && !APP.busy) Game.escalateGfx('shader'); }
   const dtMs = Math.min(100, Math.max(0, now - (APP.last || now))); APP.last = now;
   if (document.hidden || GFX.lost || APP.halted || APP.busy) return;
   const dt = dtMs / 1000;
@@ -4502,6 +4642,7 @@ function main() {
   setTimeout(() => {
     try { Showroom.build(); } catch (e) { console.error(e); bootFail('The ' + PRESETS[GFX.id].name + ' graphics preset could not start on this device', String(e && e.message || e), GFX.id !== 'normal'); return; }
     APP.mode = 'menu'; UI.show('main'); setMusic('menu'); APEX_LOADER.progress(1, 'Ready'); APEX_LOADER.done(); APP.last = performance.now(); APP.raf = requestAnimationFrame(frame);
+    { const fm = GFX.takeFixMsg(); if (fm) setTimeout(() => UI.notice(fm), 1400); }
     if (GFX.caps && GFX.caps.recommend !== GFX.id && !s.recNoted && !Store.get(SAVE_KEY + '_seen')) { Store.set(SAVE_KEY + '_seen', '1'); setTimeout(() => UI.notice('Tip: ' + PRESETS[GFX.caps.recommend].name + ' graphics are recommended for this device (Settings)'), 1800); }
   }, 30);
 }
